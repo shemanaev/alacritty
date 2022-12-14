@@ -5,9 +5,9 @@ use std::{mem, ptr};
 use mio_anonymous_pipes::{EventedAnonRead, EventedAnonWrite};
 use winapi::shared::basetsd::{PSIZE_T, SIZE_T};
 use winapi::shared::minwindef::BYTE;
-use winapi::shared::ntdef::LPWSTR;
+use winapi::shared::ntdef::{HANDLE, HRESULT, LPWSTR};
 use winapi::shared::winerror::S_OK;
-use winapi::um::consoleapi::{ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole};
+use winapi::um::libloaderapi::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use winapi::um::processthreadsapi::{
     CreateProcessW, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
     PROCESS_INFORMATION, STARTUPINFOW,
@@ -20,9 +20,55 @@ use crate::event::{OnResize, WindowSize};
 use crate::tty::windows::child::ChildExitWatcher;
 use crate::tty::windows::{cmdline, win32_string, Pty};
 
+/// Dynamically load the pseudoconsole API from either kernel32.dll
+/// or conpty.dll, depending on if the latter exists or not. The conpty.dll
+/// from the Windows Terminal project supports loading OpenConsole.exe, which
+/// has has many improvements and bugfixes compared to the standard conpty that
+/// ships with Windows.
+///
+/// Just copy the conpty.dll and OpenConsole.exe files to the same
+/// directory as the Alacritty.exe to use it.
+///
+/// The field names are deliberately PascalCase as this matches
+/// the defined symbols in kernel32 and also is the convention
+/// that the `winapi` crate follows.
+#[allow(non_snake_case)]
+struct ConptyApi {
+    CreatePseudoConsole:
+        unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT,
+    ResizePseudoConsole: unsafe extern "system" fn(HPCON, COORD) -> HRESULT,
+    ClosePseudoConsole: unsafe extern "system" fn(HPCON),
+}
+
+impl ConptyApi {
+    /// Load the API or None if it cannot be found.
+    pub fn new() -> Option<Self> {
+        // Unsafe because windows API calls.
+        unsafe {
+            let mut hmodule = LoadLibraryA("conpty.dll\0".as_ptr() as _);
+            if hmodule.is_null() {
+                // Otherwise just use the standard conpty from kernel32.
+                hmodule = GetModuleHandleA("kernel32\0".as_ptr() as _);
+            }
+            assert!(!hmodule.is_null());
+
+            let cpc = GetProcAddress(hmodule, "CreatePseudoConsole\0".as_ptr() as _);
+            let rpc = GetProcAddress(hmodule, "ResizePseudoConsole\0".as_ptr() as _);
+            let clpc = GetProcAddress(hmodule, "ClosePseudoConsole\0".as_ptr() as _);
+
+            Some(Self {
+                CreatePseudoConsole: mem::transmute(cpc),
+                ResizePseudoConsole: mem::transmute(rpc),
+                ClosePseudoConsole: mem::transmute(clpc),
+            })
+        }
+    }
+}
+
 /// RAII Pseudoconsole.
 pub struct Conpty {
     pub handle: HPCON,
+    api: ConptyApi,
 }
 
 impl Drop for Conpty {
@@ -31,7 +77,7 @@ impl Drop for Conpty {
         // conout pipe has already been dropped by this point.
         //
         // See PR #3084 and https://docs.microsoft.com/en-us/windows/console/closepseudoconsole.
-        unsafe { ClosePseudoConsole(self.handle) }
+        unsafe { (self.api.ClosePseudoConsole)(self.handle) }
     }
 }
 
@@ -39,6 +85,7 @@ impl Drop for Conpty {
 unsafe impl Send for Conpty {}
 
 pub fn new(config: &PtyConfig, window_size: WindowSize) -> Option<Pty> {
+    let api = ConptyApi::new()?;
     let mut pty_handle = 0 as HPCON;
 
     // Passing 0 as the size parameter allows the "system default" buffer
@@ -50,7 +97,7 @@ pub fn new(config: &PtyConfig, window_size: WindowSize) -> Option<Pty> {
 
     // Create the Pseudo Console, using the pipes.
     let result = unsafe {
-        CreatePseudoConsole(
+        (api.CreatePseudoConsole)(
             window_size.into(),
             conin_pty_handle.into_raw_handle(),
             conout_pty_handle.into_raw_handle(),
@@ -158,7 +205,7 @@ pub fn new(config: &PtyConfig, window_size: WindowSize) -> Option<Pty> {
     let conout = EventedAnonRead::new(conout);
 
     let child_watcher = ChildExitWatcher::new(proc_info.hProcess).unwrap();
-    let conpty = Conpty { handle: pty_handle };
+    let conpty = Conpty { handle: pty_handle as HPCON, api };
 
     Some(Pty::new(conpty, conout, conin, child_watcher))
 }
@@ -170,7 +217,7 @@ fn panic_shell_spawn() {
 
 impl OnResize for Conpty {
     fn on_resize(&mut self, window_size: WindowSize) {
-        let result = unsafe { ResizePseudoConsole(self.handle, window_size.into()) };
+        let result = unsafe { (self.api.ResizePseudoConsole)(self.handle, window_size.into()) };
         assert_eq!(result, S_OK);
     }
 }

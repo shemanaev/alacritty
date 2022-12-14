@@ -1,3 +1,11 @@
+# alacritty-conpty
+
+Alacritty with [conpty](https://github.com/fredizzimo/alacritty/tree/add_openconsole_support) patch applied.
+
+In order to activate conpty you must obtain `conpty.dll` and `OpenConsole.exe` anywhere (build yourself from [terminal](https://github.com/microsoft/terminal#developer-guidance) or just copy from [WezTerm release](https://github.com/wez/wezterm/releases)).
+
+---
+
 <p align="center">
     <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
